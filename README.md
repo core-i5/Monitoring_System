@@ -72,6 +72,11 @@ python3 manage_monitor_app.py --stop
 python3 manage_monitor_app.py --log
 ```
 
+### Run test case
+```bash
+python -m unittest discover -s test -p tests
+```
+
 ## How It Works
 
 Upon running the project, a graphical dialog box will appear to let the user select two directories:
