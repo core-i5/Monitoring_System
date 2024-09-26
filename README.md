@@ -121,3 +121,51 @@ monitoring_system/
 
 - The **PII filtering** functionality can be enhanced for more specific use cases. Currently, basic PII filters have been implemented based on general assumptions.
 - There may be unhandled edge cases or scenarios in the current system. If you encounter any, please report them, and I'll address the issue in a future update.
+
+
+
+## Amendments
+
+
+### Updates to PII Filtering:
+
+Earlier:
+```python
+patterns = {
+    # File paths like "C:\Users\username"
+    "file_paths": r"[A-Z]:\\Users\\\w+",
+}
+
+replacements = {
+    "file_paths": r"<drive>:\\Users\\<username>",
+}
+```
+
+Now:
+```python
+patterns = {
+    # File paths like "C:\Users\username"
+    "file_paths": r"([A-Za-z]):(\\*)Users(\\*)([^\\]+)",
+}
+
+replacements = {
+    "file_paths": lambda m: f'<d>{m.group(2)}Users{m.group(3)}<u>',
+}
+```
+**Explanation**: The regex has been improved to capture more variations in the file paths. The `replacement` now uses a lambda function, allowing for dynamic insertion of components into the replacement string.
+
+---
+
+### Change in Processing Approach:
+
+**Earlier**:  
+
+- **Thread-based Approach**, single thread is responsible for processing .txt files sequentially, ensuring that one file is processed at a time.
+- This approach works well for smaller workloads but might become a bottleneck if multiple files are created simultaneously, as only one file is processed at a time.
+
+**Now**:  
+
+- The use of **ThreadPoolExecutor** allows multiple .txt files to be processed concurrently.
+- This approach is more scalable, as it can handle multiple files being created in rapid succession by distributing the work across several threads.
+- It’s a better fit for scenarios with high file creation rates, as it reduces the bottleneck of a single-threaded queue.
+

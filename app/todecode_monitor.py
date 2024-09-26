@@ -5,11 +5,12 @@ import sys
 import re
 import time
 import calendar
-from queue import Queue
-from threading import Thread
 from utils import logger_setup
+from concurrent.futures import ThreadPoolExecutor
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+
+WORKER_TREAD_COUNT = 5
 
 logger = logger_setup('logs/todecode_monitor.log')
 
@@ -19,37 +20,28 @@ class ZipFileHandler(FileSystemEventHandler):
     Handler for detecting new zip files, unzipping them, and applying PII filtering.
     """
 
-    def __init__(self, output_folder, input_folder, processing_queue):
+    def __init__(self, output_folder, input_folder, executor):
         super().__init__()
         self.output_folder = output_folder
         self.input_folder = input_folder
-        self.processing_queue = processing_queue
+        self.executor = executor
 
     def on_modified(self, event):
         if event.src_path.endswith(".zip"):
             logger.info(f"Modified zip file detected: {event.src_path}")
-            self.processing_queue.put(event.src_path)
+            self.executor.submit(self.process_files, event.src_path)
 
     def on_created(self, event):
         if event.src_path.endswith(".zip"):
             logger.info(f"New zip file detected: {event.src_path}")
-            self.processing_queue.put(event.src_path)
+            self.executor.submit(self.process_files, event.src_path)
 
-    def process_files(self):
-        while True:
-            zip_file_path = self.processing_queue.get()
-            if zip_file_path is None:
-                break  # Graceful exit
+    def process_files(self, zip_file_path):
             try:
-                # Ensure the file is not being written to (i.e., not locked)
-                if self.is_file_locked(zip_file_path):
-                    time.sleep(1)
-                    continue  # Wait and retry if the file is locked
                 self.extract_and_filter(zip_file_path)
                 os.remove(zip_file_path)
             except Exception as e:
                 logger.error(f"Error extracting and filtering zip file {zip_file_path}: {str(e)}", stack_info=True, exc_info=True)
-            self.processing_queue.task_done()
 
     def extract_and_filter(self, zip_file):
         """
@@ -60,6 +52,7 @@ class ZipFileHandler(FileSystemEventHandler):
         try:
             with pyzipper.AESZipFile(zip_file, 'r') as zf:
                 zf.pwd = bytes(password, 'utf-8')
+                extracted_files = [name for name in zf.namelist() if name.endswith('.txt')]
                 zf.extractall(self.input_folder)
 
         except RuntimeError as e:
@@ -67,9 +60,9 @@ class ZipFileHandler(FileSystemEventHandler):
         except Exception as e:
             logger.error(f"An unexpected error occurred: {e}", stack_info=True, exc_info=True)
 
-        txt_files = glob.glob(os.path.join(self.input_folder, "*.txt"))
 
-        for txt_file_path in txt_files:
+        for txt_file in extracted_files:
+            txt_file_path = os.path.join(self.input_folder, txt_file)
             self.pii_filter(txt_file_path)
 
     def pii_filter(self, file_path):
@@ -84,10 +77,8 @@ class ZipFileHandler(FileSystemEventHandler):
         with open(file_path, 'r') as file:
             content = file.read()
 
-        # Patterns to filter out various forms of PII
         patterns = {
-            # File paths like "C:\Users\username"
-            "file_paths": r"[A-Z]:\\Users\\\w+",
+            "file_paths": r"([A-Za-z]):(\\*)Users(\\*)([^\\]+)",
             # Email addresses
             "emails": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
             # Phone numbers (e.g., (123) 456-7890, 123-456-7890, +1-234-567-8900)
@@ -104,9 +95,8 @@ class ZipFileHandler(FileSystemEventHandler):
             "addresses": r"\b\d{1,4}\s[A-Za-z0-9\s]+(?:St|Street|Ave|Avenue|Blvd|Boulevard|Rd|Road|Lane|Ln|Dr|Drive|Ct|Court)\b",
         }
 
-        # Replace matches with generic placeholders
         replacements = {
-            "file_paths": r"<drive>:\\Users\\<username>",
+            "file_paths": lambda m: f'<d>{m.group(2)}Users{m.group(3)}<u>',
             "emails": r"<email>",
             "phone_numbers": r"<phone_number>",
             "dates": r"<date>",
@@ -120,6 +110,18 @@ class ZipFileHandler(FileSystemEventHandler):
 
         for key, pattern in patterns.items():
             content = re.sub(pattern, replacements[key], content)
+
+        # patterns = {
+        #     r"(?<!\\)\\[a-zA-Z](?=\\)": "<d>",                              # Disk Name
+        #     r"\\Users\\[^\\]+": "<u>",                                       # Username
+        #     r"\b(?:\d{1,3}\.){3}\d{1,3}\b": "<ip>",                          # IP Address
+        #     r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b": "<email>",# Email Address
+        #     r"\b(?:\d{1,2}[\/\.-]){2}\d{2,4}\b": "<date>",                   # Date (MM/DD/YYYY, DD.MM.YYYY, etc.)
+        #     r"\b\d{1,4}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,4}\b": "<phone>" # Phone number
+        # }
+    
+        # for pattern, replacements  in patterns.items():
+        #     content = re.sub(pattern, replacements, content)
 
         filtered_file = os.path.join(self.output_folder, f"PII_filtered_{os.path.basename(file_path)}")
         with open(filtered_file, 'w') as file:
@@ -149,19 +151,6 @@ class ZipFileHandler(FileSystemEventHandler):
             logger.error(f"Timestamp not found in the zip file name: {zip_file_name}", stack_info=True, exc_info=True)
 
 
-    def is_file_locked(self, file_path):
-        """
-        Check if the file is still being written (locked).
-        Returns True if the file is locked, False otherwise.
-        """
-        try:
-            with open(file_path, 'rb'):
-                pass
-        except OSError:
-            return True
-        return False
-
-
 def start_todecode_monitor(output_folder):
     """
     Starts the todecode folder monitor to unzip files and apply PII filtering.
@@ -170,29 +159,22 @@ def start_todecode_monitor(output_folder):
     input_folder = "todecode"
     os.makedirs(input_folder, exist_ok=True)
 
-    processing_queue = Queue()
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        event_handler = ZipFileHandler(output_folder, input_folder, executor)
+        observer = Observer()
+        observer.schedule(event_handler, input_folder, recursive=False)
+        observer.start()
 
-    event_handler = ZipFileHandler(output_folder, input_folder, processing_queue)
-    observer = Observer()
-    observer.schedule(event_handler, input_folder, recursive=False)
-    observer.start()
+        logger.info(f"Todecode folder monitor started. Monitoring folder: {input_folder}")
 
-    # Start processing thread
-    processing_thread = Thread(target=event_handler.process_files, daemon=True)
-    processing_thread.start()
+        try:
+            while True:
+                time.sleep(1)
+        except Exception as e:
+            logger.error(f"Error in Todecode Monitor: {str(e)}", stack_info=True, exc_info=True)
+            observer.stop()
 
-    logger.info(f"Todecode folder monitor started. Monitoring folder: {input_folder}")
-
-    try:
-        while True:
-            time.sleep(1)
-    except Exception as e:
-        logger.error(f"Error in Todecode Monitor: {str(e)}", stack_info=True, exc_info=True)
-        observer.stop()
-
-    processing_queue.put(None)  # Signal thread to stop
-    processing_thread.join()
-    observer.join()
+        observer.join()
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
